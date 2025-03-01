@@ -142,8 +142,17 @@ app.post('/api/rooms', verifyToken, async (req, res) => {
 });
 
 // WebSocket 연결 처리
-wss.on('connection', (ws) => {
-  console.log('New WebSocket connection');
+wss.on('connection', (ws, req) => {
+  console.log(`새 WebSocket 연결 (IP: ${req.socket.remoteAddress})`);
+  
+  // Add connection tracking
+  ws.isAlive = true;
+  
+  // Ping mechanism to keep connection alive
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+  
   let authenticated = false;
   let username = null;
   const subscriptions = new Map(); // 사용자의 구독 정보 관리
@@ -347,10 +356,32 @@ wss.on('connection', (ws) => {
   }
   
   // 연결 종료 처리
-  ws.on('close', () => {
-    console.log(`WebSocket connection closed${username ? ` for user ${username}` : ''}`);
+  ws.on('close', (code, reason) => {
+    console.log(`WebSocket connection closed: code=${code}, reason=${reason || 'No reason'}, user=${username || 'Unknown'}`);
+    
+    // 모든 구독 정리
     cleanupSubscriptions();
+    
+    // 디버깅 정보 출력
+    if (code !== 1000) {
+      console.log('비정상 종료: 연결이 예기치 않게 종료되었습니다');
+    }
   });
+});
+
+// Add a ping interval to keep connections alive
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    
+    ws.isAlive = false;
+    ws.ping(() => {});
+  });
+}, 30000);
+
+// Clean up on server close
+wss.on('close', () => {
+  clearInterval(interval);
 });
 
 // 서버 시작
@@ -369,4 +400,10 @@ process.on('SIGINT', async () => {
   if (rabbitConnection) await rabbitConnection.close();
   
   process.exit(0);
+});
+
+// 서버에 uncaughtException 핸들러 추가
+process.on('uncaughtException', (err) => {
+  console.error('처리되지 않은 예외:', err);
+  // 프로덕션 환경에서는 여기서 종료하지 않도록 주의
 }); 
