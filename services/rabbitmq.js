@@ -51,7 +51,8 @@ async function publishMessage(roomId, message) {
 }
 
 // 메시지 구독
-async function subscribeToRoom(roomId, callback) {
+async function subscribeToRoom(roomId, messageCallback) {
+  console.log(`Setting up RabbitMQ subscription for room ${roomId}`);
   if (!rabbitChannel) {
     throw new Error('RabbitMQ channel not available');
   }
@@ -60,13 +61,18 @@ async function subscribeToRoom(roomId, callback) {
   await rabbitChannel.bindQueue(queue, 'chat_exchange', roomId);
   
   const consumerTag = (await rabbitChannel.consume(queue, (msg) => {
-    if (msg !== null) {
+    console.log(`RabbitMQ message received for room ${roomId}`);
+    try {
       const content = JSON.parse(msg.content.toString());
-      callback(content);
+      console.log(`Processing RabbitMQ message for room ${roomId}:`, content);
+      messageCallback(content);
       rabbitChannel.ack(msg);
+    } catch (error) {
+      console.error('Error processing RabbitMQ message:', error);
     }
   })).consumerTag;
   
+  console.log(`RabbitMQ subscription successful for room ${roomId}, tag: ${consumerTag}`);
   return { queue, consumerTag };
 }
 
@@ -91,6 +97,18 @@ function getChannel() {
 
 function getConnection() {
   return rabbitConnection;
+}
+
+// 테스트 메시지 전송 함수 찾기
+// 예:
+function startTestMessageService() {
+  // 테스트 메시지 전송을 비활성화
+  return; // 함수를 조기 종료하여 테스트 메시지를 보내지 않음
+  
+  // 기존 코드
+  setInterval(() => {
+    // 테스트 메시지 전송 코드
+  }, 10000);
 }
 
 module.exports = {

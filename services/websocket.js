@@ -149,11 +149,15 @@ async function handleJoin(ws, data) {
     const subscription = await subscribeToRoom(roomId, async (content) => {
       console.log(`Received message from RabbitMQ for room ${roomId}:`, content);
       if (ws.readyState === WebSocket.OPEN) {
+        console.log(`Sending message to client ${ws.username} for room ${roomId}`);
         // 발신자 정보 확인하여 NEW_MESSAGE 타입 추가
         if (!content.type) {
           content.type = 'NEW_MESSAGE';
         }
         ws.send(JSON.stringify(content));
+        console.log(`Message sent to client ${ws.username}`);
+      } else {
+        console.log(`WebSocket not open for ${ws.username}, state: ${ws.readyState}`);
       }
     });
     
@@ -274,12 +278,6 @@ async function handleChatMessage(ws, data) {
     // RabbitMQ에 메시지 발행
     console.log('Publishing message to RabbitMQ');
     await publishMessage(roomId, messageData);
-    
-    // 발신자에게도 메시지 에코 (자신이 보낸 메시지도 화면에 표시하기 위해)
-    if (ws.readyState === WebSocket.OPEN) {
-      console.log('Echoing message back to sender');
-      ws.send(JSON.stringify(messageData));
-    }
   } catch (error) {
     console.error('Error handling chat message:', error);
     sendErrorToClient(ws, 'Failed to send message');
@@ -338,6 +336,29 @@ function pingClient(ws) {
   ws.isAlive = false;
   ws.ping(() => {});
 }
+
+// 테스트 메시지 함수 (실행되지 않도록 수정)
+function testRabbitMQ(roomId) {
+  // 함수는 유지하되 실행하지 않음
+  console.log('Test message function called but disabled');
+  return; // 즉시 반환하여 메시지를 보내지 않음
+  
+  // 아래 코드는 실행되지 않음
+  const testMessage = {
+    type: 'NEW_MESSAGE',
+    roomId,
+    content: '서버 테스트 메시지',
+    timestamp: new Date(),
+    sender: 'SYSTEM',
+    _id: 'test-' + Date.now()
+  };
+  
+  console.log('Sending test message to RabbitMQ:', testMessage);
+  publishMessage(roomId, testMessage);
+}
+
+// 테스트 모드 비활성화 (기존 코드 주석 처리)
+console.log('RabbitMQ test mode is DISABLED');
 
 module.exports = {
   setupWebSocketServer

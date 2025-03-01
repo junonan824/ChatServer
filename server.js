@@ -30,6 +30,9 @@ app.get('/', (req, res) => {
 // 클라이언트 호환성을 위한 직접 라우트 정의
 app.post('/api/login', login);
 
+// 변경 코드:
+const ENABLE_TEST_MESSAGES = false; // 테스트 메시지 비활성화
+
 // 서비스 초기화
 async function initializeServices() {
   try {
@@ -47,6 +50,13 @@ async function initializeServices() {
       console.log(`Server running on port ${config.PORT}`);
       console.log(`WebSocket endpoint available at ws://localhost:${config.PORT}`);
     });
+
+    // 변경 코드:
+    if (ENABLE_TEST_MESSAGES) {
+      testMessageInterval = setInterval(() => {
+        sendTestMessage();
+      }, 10000);
+    }
   } catch (error) {
     console.error('Failed to initialize services:', error);
     process.exit(1);
