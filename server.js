@@ -5,7 +5,6 @@ const amqp = require('amqplib');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const stompit = require('stompit');
 
 // Create Express app
 const app = express();
@@ -20,98 +19,115 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 // JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+const JWT_SECRET = process.env.JWT_SECRET || 'my_super_secret_key';
 
 // RabbitMQ Connection
 let rabbitConnection = null;
 let rabbitChannel = null;
 
-// STOMP configurations
-const stompConnections = new Map();
-const stompServers = [];
+// 간단한 사용자 DB (실제로는 MongoDB 등 사용)
+const users = [
+  { username: 'alice', password: '1234' },
+  { username: 'bob', password: '1234' },
+  { username: 'charlie', password: '1234' }
+];
 
 // Connect to RabbitMQ
 async function connectToRabbitMQ() {
   try {
-    rabbitConnection = await amqp.connect('amqp://localhost');
+    // RabbitMQ 연결
+    const RABBIT_URL = process.env.RABBIT_URL || 'amqp://localhost';
+    rabbitConnection = await amqp.connect(RABBIT_URL);
     rabbitChannel = await rabbitConnection.createChannel();
     
     console.log('Connected to RabbitMQ');
     
-    // Declare exchange for chat messages
-    await rabbitChannel.assertExchange('chat_exchange', 'topic', { durable: false });
+    // 채팅 메시지용 exchange 선언
+    await rabbitChannel.assertExchange('chat_exchange', 'topic', { durable: true });
     
-    // Set up STOMP broker connection to RabbitMQ
-    const stompConnectOptions = {
-      host: 'localhost',
-      port: 61613, // Default STOMP port for RabbitMQ
-      connectHeaders: {
-        login: 'guest',
-        passcode: 'guest'
-      }
-    };
-    
-    stompit.connect(stompConnectOptions, (error, client) => {
-      if (error) {
-        console.error('STOMP connection error:', error);
-        return;
-      }
-      console.log('STOMP connection to RabbitMQ established');
-      stompServers.push(client);
-    });
-    
+    return true;
   } catch (error) {
     console.error('Error connecting to RabbitMQ:', error);
-    setTimeout(connectToRabbitMQ, 5000); // Retry connection
+    setTimeout(connectToRabbitMQ, 5000); // 재연결 시도
+    return false;
+  }
+}
+
+// 토큰 검증 함수
+function validateToken(token) {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    return decoded.username;
+  } catch (err) {
+    return null;
   }
 }
 
 // Connect to RabbitMQ on startup
 connectToRabbitMQ();
 
-// Basic route
+// 기본 라우트
 app.get('/', (req, res) => {
   res.send('Real-time Chat Server with RabbitMQ is running');
 });
 
-// User authentication route
+// 로그인 엔드포인트 (JWT 발급)
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
+  const user = users.find(u => u.username === username && u.password === password);
   
-  // In a real application, you'd verify credentials against a database
-  // This is a simplified example
-  if (username && password) {
-    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, username });
-  } else {
-    res.status(401).json({ error: 'Invalid credentials' });
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid credentials' });
   }
+  
+  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '1h' });
+  res.json({ token, username });
 });
 
-// Chat room endpoint to get room information
+// JWT 토큰 검증 미들웨어
+function verifyToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) return res.status(401).json({ error: 'Access denied' });
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// 채팅방 정보 조회 엔드포인트
 app.get('/api/rooms/:roomId', verifyToken, (req, res) => {
   const roomId = req.params.roomId;
   
-  // In a real app, we'd fetch room details from a database
+  // 실제 구현에서는 DB에서 조회
   res.json({
     id: roomId,
     name: `Chat Room ${roomId}`,
     description: 'A sample chat room',
-    participants: ['user1', 'user2'] // Example data
+    participants: ['user1', 'user2'] // 예시 데이터
   });
 });
 
-// Create a new chat room
+// 채팅방 생성 엔드포인트
 app.post('/api/rooms', verifyToken, async (req, res) => {
   const { name, description } = req.body;
   const roomId = `room_${Date.now()}`;
   
   try {
-    // Create a queue for this room in RabbitMQ
+    if (!rabbitChannel) {
+      return res.status(503).json({ error: 'Message broker unavailable' });
+    }
+    
+    // RabbitMQ에 해당 방을 위한 큐 생성
     await rabbitChannel.assertQueue(roomId, { durable: true });
     await rabbitChannel.bindQueue(roomId, 'chat_exchange', roomId);
     
-    // In a real app, we'd store room details in a database
+    // 실제 구현에서는 DB에 저장
     res.status(201).json({
       id: roomId,
       name,
@@ -125,117 +141,232 @@ app.post('/api/rooms', verifyToken, async (req, res) => {
   }
 });
 
-// Middleware to verify JWT token
-function verifyToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  
-  if (!token) return res.status(401).json({ error: 'Access denied' });
-  
-  try {
-    const verified = jwt.verify(token, JWT_SECRET);
-    req.user = verified;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-}
-
-// WebSocket connection
+// WebSocket 연결 처리
 wss.on('connection', (ws) => {
   console.log('New WebSocket connection');
   let authenticated = false;
   let username = null;
+  const subscriptions = new Map(); // 사용자의 구독 정보 관리
   
   ws.on('message', async (message) => {
     try {
-      const data = JSON.parse(message);
+      const parsedMessage = JSON.parse(message);
+      const { command, headers, body } = parsedMessage;
       
-      // Handle authentication
-      if (data.type === 'authenticate') {
-        try {
-          const decoded = jwt.verify(data.token, JWT_SECRET);
-          authenticated = true;
-          username = decoded.username;
-          ws.send(JSON.stringify({ type: 'auth_success', username }));
-          console.log(`User ${username} authenticated`);
-        } catch (error) {
-          ws.send(JSON.stringify({ type: 'auth_error', error: 'Invalid token' }));
-        }
-        return;
-      }
-      
-      // All other messages require authentication
-      if (!authenticated) {
-        ws.send(JSON.stringify({ type: 'error', error: 'Authentication required' }));
-        return;
-      }
-      
-      // Handle subscribing to a room
-      if (data.type === 'subscribe') {
-        const roomId = data.roomId;
-        console.log(`User ${username} subscribing to room ${roomId}`);
-        
-        // Set up consumer for this room
-        rabbitChannel.consume(roomId, (msg) => {
-          if (msg) {
-            const content = msg.content.toString();
-            ws.send(JSON.stringify({ 
-              type: 'message', 
-              roomId,
-              content: JSON.parse(content)
-            }));
-            rabbitChannel.ack(msg);
+      // STOMP-like 프로토콜 구현
+      switch (command) {
+        case 'CONNECT':
+          // 토큰으로 인증
+          const token = headers.token;
+          if (!token) {
+            sendError(ws, 'Authentication required');
+            return;
           }
-        });
-        
-        ws.roomSubscriptions = ws.roomSubscriptions || [];
-        ws.roomSubscriptions.push(roomId);
-        
-        ws.send(JSON.stringify({ type: 'subscribed', roomId }));
-        return;
+          
+          username = validateToken(token);
+          if (!username) {
+            sendError(ws, 'Invalid token');
+            return;
+          }
+          
+          authenticated = true;
+          ws.send(JSON.stringify({
+            command: 'CONNECTED',
+            headers: { user: username }
+          }));
+          break;
+          
+        case 'SUBSCRIBE':
+          if (!authenticated) {
+            sendError(ws, 'Authentication required');
+            return;
+          }
+          
+          const { destination } = headers;
+          if (!destination) {
+            sendError(ws, 'Destination required');
+            return;
+          }
+          
+          // RabbitMQ에 구독 설정
+          try {
+            if (!rabbitChannel) {
+              sendError(ws, 'Message broker unavailable');
+              return;
+            }
+            
+            const consumerTag = await rabbitChannel.consume(
+              destination,
+              (msg) => {
+                if (msg) {
+                  const content = msg.content.toString();
+                  ws.send(JSON.stringify({
+                    command: 'MESSAGE',
+                    headers: {
+                      destination,
+                      'message-id': msg.properties.messageId || Date.now().toString()
+                    },
+                    body: content
+                  }));
+                  rabbitChannel.ack(msg);
+                }
+              }
+            );
+            
+            // 구독 정보 저장
+            subscriptions.set(destination, consumerTag.consumerTag);
+            
+            ws.send(JSON.stringify({
+              command: 'RECEIPT',
+              headers: {
+                'receipt-id': headers['receipt-id'] || Date.now().toString(),
+                subscription: destination
+              }
+            }));
+          } catch (error) {
+            console.error('Subscription error:', error);
+            sendError(ws, 'Failed to subscribe: ' + error.message);
+          }
+          break;
+          
+        case 'SEND':
+          if (!authenticated) {
+            sendError(ws, 'Authentication required');
+            return;
+          }
+          
+          const { destination: dest } = headers;
+          if (!dest || !body) {
+            sendError(ws, 'Destination and body required');
+            return;
+          }
+          
+          // RabbitMQ로 메시지 발행
+          try {
+            if (!rabbitChannel) {
+              sendError(ws, 'Message broker unavailable');
+              return;
+            }
+            
+            const messageData = {
+              sender: username,
+              content: body,
+              timestamp: new Date().toISOString()
+            };
+            
+            rabbitChannel.publish(
+              'chat_exchange',
+              dest,
+              Buffer.from(JSON.stringify(messageData)),
+              { 
+                persistent: true,
+                messageId: Date.now().toString()
+              }
+            );
+            
+            ws.send(JSON.stringify({
+              command: 'RECEIPT',
+              headers: {
+                'receipt-id': headers['receipt-id'] || Date.now().toString()
+              }
+            }));
+          } catch (error) {
+            console.error('Message publishing error:', error);
+            sendError(ws, 'Failed to send message: ' + error.message);
+          }
+          break;
+          
+        case 'UNSUBSCRIBE':
+          if (!authenticated) {
+            sendError(ws, 'Authentication required');
+            return;
+          }
+          
+          const { id } = headers;
+          if (!id || !subscriptions.has(id)) {
+            sendError(ws, 'Invalid subscription');
+            return;
+          }
+          
+          try {
+            // RabbitMQ 구독 취소
+            if (rabbitChannel) {
+              await rabbitChannel.cancel(subscriptions.get(id));
+            }
+            
+            subscriptions.delete(id);
+            
+            ws.send(JSON.stringify({
+              command: 'RECEIPT',
+              headers: {
+                'receipt-id': headers['receipt-id'] || Date.now().toString()
+              }
+            }));
+          } catch (error) {
+            console.error('Unsubscribe error:', error);
+            sendError(ws, 'Failed to unsubscribe: ' + error.message);
+          }
+          break;
+          
+        case 'DISCONNECT':
+          // 모든 구독 정리
+          cleanupSubscriptions();
+          ws.close();
+          break;
+          
+        default:
+          sendError(ws, `Unknown command: ${command}`);
       }
-      
-      // Handle sending a message to a room
-      if (data.type === 'message') {
-        const { roomId, text } = data;
-        console.log(`Message from ${username} to room ${roomId}: ${text}`);
-        
-        const messageData = {
-          sender: username,
-          text,
-          timestamp: new Date().toISOString()
-        };
-        
-        // Publish message to RabbitMQ
-        rabbitChannel.publish(
-          'chat_exchange', 
-          roomId, 
-          Buffer.from(JSON.stringify(messageData)),
-          { persistent: true }
-        );
-        
-        return;
-      }
-      
     } catch (error) {
       console.error('Error processing WebSocket message:', error);
-      ws.send(JSON.stringify({ type: 'error', error: 'Failed to process message' }));
+      sendError(ws, 'Failed to process message');
     }
   });
   
+  // 에러 메시지 전송 헬퍼 함수
+  function sendError(ws, message) {
+    ws.send(JSON.stringify({
+      command: 'ERROR',
+      headers: {},
+      body: message
+    }));
+  }
+  
+  // 구독 정리 함수
+  function cleanupSubscriptions() {
+    if (rabbitChannel) {
+      for (const [destination, consumerTag] of subscriptions.entries()) {
+        try {
+          rabbitChannel.cancel(consumerTag);
+        } catch (error) {
+          console.error(`Error canceling subscription to ${destination}:`, error);
+        }
+      }
+    }
+    subscriptions.clear();
+  }
+  
+  // 연결 종료 처리
   ws.on('close', () => {
     console.log(`WebSocket connection closed${username ? ` for user ${username}` : ''}`);
-    // Clean up any subscriptions
-    if (ws.roomSubscriptions && ws.roomSubscriptions.length > 0) {
-      // In a real implementation, you might need to clean up RabbitMQ consumers here
-    }
+    cleanupSubscriptions();
   });
 });
 
-// Start the server
+// 서버 시작
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`WebSocket endpoint available at ws://localhost:${PORT}`);
+});
+
+// 종료 시 리소스 정리
+process.on('SIGINT', async () => {
+  console.log('Shutting down server...');
+  
+  // RabbitMQ 연결 종료
+  if (rabbitChannel) await rabbitChannel.close();
+  if (rabbitConnection) await rabbitConnection.close();
+  
+  process.exit(0);
 }); 
