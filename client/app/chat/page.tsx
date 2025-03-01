@@ -111,6 +111,27 @@ export default function ChatPage() {
     
     connectWebSocket();
     
+    // 사용 가능한 채팅방 목록 가져오기
+    const fetchRooms = async () => {
+      try {
+        const token = localStorage.getItem('chatToken');
+        const response = await fetch('http://localhost:4000/api/rooms', {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
+        
+        if (response.ok) {
+          const rooms = await response.json();
+          setAvailableRooms(rooms.map(room => room.id));
+        }
+      } catch (error) {
+        console.error('Error fetching rooms:', error);
+      }
+    };
+    
+    fetchRooms();
+    
     return () => {
       // 정리 함수에서 연결 상태 확인 후 정상적으로 종료
       if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {

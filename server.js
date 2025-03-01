@@ -5,6 +5,11 @@ const amqp = require('amqplib');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const mongoose = require('mongoose');
+
+// MongoDB 모델 가져오기
+const Message = require('./models/message');
+const Room = require('./models/room');
 
 // Create Express app
 const app = express();
@@ -20,6 +25,9 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'my_super_secret_key';
+
+// MongoDB 연결 URL
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/chat_app';
 
 // RabbitMQ Connection
 let rabbitConnection = null;
@@ -66,6 +74,53 @@ function validateToken(token) {
 // Connect to RabbitMQ on startup
 connectToRabbitMQ();
 
+// MongoDB에 연결
+mongoose.connect(MONGODB_URI)
+  .then(() => {
+    console.log('Connected to MongoDB at:', MONGODB_URI);
+    
+    // 초기 설정: 필요한 컬렉션과 인덱스 확인
+    return Promise.all([
+      Room.createCollection(),
+      Message.createCollection()
+    ]);
+  })
+  .then(() => {
+    console.log('MongoDB collections initialized');
+    // 데이터베이스 목록 확인
+    mongoose.connection.db.admin().listDatabases()
+      .then(result => {
+        console.log('Available databases:', result.databases.map(db => db.name));
+      })
+      .catch(err => console.error('Failed to list databases:', err));
+  })
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    console.log('MongoDB 연결에 실패했습니다. MongoDB가 설치되어 있고 실행 중인지 확인하세요.');
+    console.log('자동 재연결을 시도합니다...');
+    
+    // 재연결 시도 함수
+    const retryConnection = (retries = 5, interval = 5000) => {
+      if (retries === 0) {
+        console.error('MongoDB 연결 재시도 실패. 서버는 계속 실행되지만 DB 기능은 제한됩니다.');
+        return;
+      }
+      
+      setTimeout(() => {
+        console.log(`MongoDB 재연결 시도 (남은 시도: ${retries})...`);
+        
+        mongoose.connect(MONGODB_URI)
+          .then(() => console.log('MongoDB에 성공적으로 연결되었습니다!'))
+          .catch(err => {
+            console.error('MongoDB 재연결 실패:', err.message);
+            retryConnection(retries - 1, interval);
+          });
+      }, interval);
+    };
+    
+    retryConnection();
+  });
+
 // 기본 라우트
 app.get('/', (req, res) => {
   res.send('Real-time Chat Server with RabbitMQ is running');
@@ -101,24 +156,59 @@ function verifyToken(req, res, next) {
 }
 
 // 채팅방 정보 조회 엔드포인트
-app.get('/api/rooms/:roomId', verifyToken, (req, res) => {
+app.get('/api/rooms/:roomId', verifyToken, async (req, res) => {
   const roomId = req.params.roomId;
   
-  // 실제 구현에서는 DB에서 조회
-  res.json({
-    id: roomId,
-    name: `Chat Room ${roomId}`,
-    description: 'A sample chat room',
-    participants: ['user1', 'user2'] // 예시 데이터
-  });
+  try {
+    // MongoDB에서 채팅방 정보 조회
+    const room = await Room.findOne({ roomId });
+    
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+    
+    res.json({
+      id: room.roomId,
+      name: room.name,
+      description: room.description,
+      created: room.created,
+      createdBy: room.createdBy
+    });
+  } catch (error) {
+    console.error('Error fetching room:', error);
+    res.status(500).json({ error: 'Failed to get room details' });
+  }
+});
+
+// 채팅방 목록 조회 엔드포인트
+app.get('/api/rooms', verifyToken, async (req, res) => {
+  try {
+    const rooms = await Room.find().sort({ created: -1 }).lean();
+    res.json(rooms.map(room => ({
+      id: room.roomId,
+      name: room.name,
+      description: room.description,
+      created: room.created,
+      createdBy: room.createdBy
+    })));
+  } catch (error) {
+    console.error('Error fetching rooms:', error);
+    res.status(500).json({ error: 'Failed to get rooms' });
+  }
 });
 
 // 채팅방 생성 엔드포인트
 app.post('/api/rooms', verifyToken, async (req, res) => {
-  const { name, description } = req.body;
-  const roomId = `room_${Date.now()}`;
-  
   try {
+    const { name, description } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({ error: 'Room name is required' });
+    }
+    
+    // 고유한 룸 ID 생성
+    const roomId = `room-${Date.now()}`;
+    
     if (!rabbitChannel) {
       return res.status(503).json({ error: 'Message broker unavailable' });
     }
@@ -127,17 +217,32 @@ app.post('/api/rooms', verifyToken, async (req, res) => {
     await rabbitChannel.assertQueue(roomId, { durable: true });
     await rabbitChannel.bindQueue(roomId, 'chat_exchange', roomId);
     
-    // 실제 구현에서는 DB에 저장
+    // MongoDB에 채팅방 저장
+    const newRoom = new Room({
+      roomId,
+      name,
+      description,
+      createdBy: req.user.username,
+    });
+    
+    console.log('Creating room with data:', {
+      roomId,
+      name,
+      description,
+      createdBy: req.user.username,
+    });
+    
+    await newRoom.save();
+    console.log('Room created successfully:', roomId);
+    
     res.status(201).json({
       id: roomId,
       name,
-      description,
-      created: new Date().toISOString(),
-      createdBy: req.user.username
+      description
     });
   } catch (error) {
-    console.error('Error creating room:', error);
-    res.status(500).json({ error: 'Failed to create chat room' });
+    console.error('Room creation error details:', error);
+    res.status(500).json({ error: 'Failed to create room' });
   }
 });
 
@@ -204,6 +309,12 @@ wss.on('connection', (ws, req) => {
               return;
             }
             
+            // 구독 시 MongoDB에서 이전 메시지 조회 (최대 20개)
+            const previousMessages = await Message.find({ roomId: destination })
+              .sort({ timestamp: -1 })
+              .limit(20)
+              .lean();
+            
             const consumerTag = await rabbitChannel.consume(
               destination,
               (msg) => {
@@ -224,6 +335,28 @@ wss.on('connection', (ws, req) => {
             
             // 구독 정보 저장
             subscriptions.set(destination, consumerTag.consumerTag);
+            
+            // 이전 메시지 전송
+            if (previousMessages.length > 0) {
+              // 시간순으로 정렬
+              const sortedMessages = previousMessages.reverse();
+              
+              for (const msg of sortedMessages) {
+                ws.send(JSON.stringify({
+                  command: 'MESSAGE',
+                  headers: {
+                    destination,
+                    'message-id': `history-${msg._id}`,
+                    'content-type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    sender: msg.sender,
+                    content: msg.content,
+                    timestamp: msg.timestamp.toISOString()
+                  })
+                }));
+              }
+            }
             
             ws.send(JSON.stringify({
               command: 'RECEIPT',
@@ -258,10 +391,14 @@ wss.on('connection', (ws, req) => {
             }
             
             const messageData = {
+              roomId: dest,
               sender: username,
               content: body,
-              timestamp: new Date().toISOString()
+              timestamp: new Date()
             };
+            
+            const newMessage = new Message(messageData);
+            await newMessage.save();
             
             rabbitChannel.publish(
               'chat_exchange',
@@ -398,6 +535,12 @@ process.on('SIGINT', async () => {
   // RabbitMQ 연결 종료
   if (rabbitChannel) await rabbitChannel.close();
   if (rabbitConnection) await rabbitConnection.close();
+  
+  // MongoDB 연결 종료
+  if (mongoose.connection.readyState === 1) {
+    await mongoose.disconnect();
+    console.log('MongoDB disconnected');
+  }
   
   process.exit(0);
 });
