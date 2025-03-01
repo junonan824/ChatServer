@@ -1,14 +1,17 @@
 # Dependencies
 node_modules/
+/.pnp
+.pnp.js
 package-lock.json
 yarn.lock
 
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# Build outputs
+/build
+/dist
+/.next/
+/out/
+/client/.next/
+/client/out/
 
 # Environment variables
 .env
@@ -17,8 +20,21 @@ yarn-error.log*
 .env.test.local
 .env.production.local
 
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
 # Coverage directory used by tools like istanbul
 coverage/
+
+# Database
+/data/
+/dump/
+/mongodb/
+*.db
 
 # Optional npm cache directory
 .npm
@@ -40,4 +56,8 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
-*.swo 
+*.swo
+
+# Temporary files
+/tmp
+.cache/ 
