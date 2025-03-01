@@ -132,45 +132,60 @@ async function handleJoin(ws, data) {
   
   const { roomId } = data;
   
+  if (!roomId) {
+    return sendErrorToClient(ws, 'Room ID is required');
+  }
+  
+  console.log(`User ${ws.username} joining room ${roomId}`);
+  
   try {
-    // 방 존재 여부 확인
+    // 방 정보 확인
     const room = await Room.findOne({ roomId });
     if (!room) {
       return sendErrorToClient(ws, 'Room not found');
     }
     
     // RabbitMQ 구독 설정
-    const subscription = await subscribeToRoom(roomId, (message) => {
+    const subscription = await subscribeToRoom(roomId, async (content) => {
+      console.log(`Received message from RabbitMQ for room ${roomId}:`, content);
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(message));
+        // 발신자 정보 확인하여 NEW_MESSAGE 타입 추가
+        if (!content.type) {
+          content.type = 'NEW_MESSAGE';
+        }
+        ws.send(JSON.stringify(content));
       }
     });
     
-    // 구독 정보 저장
-    if (!subscriptions.has(ws.username)) {
-      subscriptions.set(ws.username, new Map());
+    // 사용자의 구독 목록에 추가
+    let userSubscriptions = subscriptions.get(ws.username);
+    if (!userSubscriptions) {
+      userSubscriptions = new Map();
+      subscriptions.set(ws.username, userSubscriptions);
     }
-    subscriptions.get(ws.username).set(roomId, subscription);
+    userSubscriptions.set(roomId, subscription);
     
-    // 방 참여 응답
+    // 방 참여 성공 응답 추가
     ws.send(JSON.stringify({
       type: 'JOIN_SUCCESS',
       roomId,
       roomName: room.name
     }));
     
-    // 최근 메시지 조회 및 전송
-    const recentMessages = await Message.find({ roomId })
+    // 과거 메시지 가져오기
+    const messages = await Message.find({ roomId })
       .sort({ timestamp: -1 })
-      .limit(config.MESSAGE_HISTORY_LIMIT);
+      .limit(config.MESSAGE_HISTORY_LIMIT)
+      .lean();
     
-    if (recentMessages.length > 0) {
-      ws.send(JSON.stringify({
-        type: 'MESSAGE_HISTORY',
-        roomId,
-        messages: recentMessages.reverse()
-      }));
-    }
+    console.log(`Found ${messages.length} historical messages for room ${roomId}`);
+    
+    // 메시지 기록 전송
+    ws.send(JSON.stringify({
+      type: 'MESSAGE_HISTORY',
+      roomId,
+      messages: messages.reverse()
+    }));
     
     console.log(`User ${ws.username} joined room ${roomId}`);
   } catch (error) {
@@ -228,28 +243,43 @@ async function handleChatMessage(ws, data) {
     return sendErrorToClient(ws, 'Invalid message format');
   }
   
+  console.log(`Processing message from ${ws.username} in room ${roomId}: ${content}`);
+  
   try {
-    // 메시지 생성
+    // 메시지 데이터 준비
     const messageData = {
       type: 'NEW_MESSAGE',
       roomId,
-      username: ws.username,
       content,
-      timestamp: new Date().toISOString()
+      timestamp: new Date(),
+      sender: ws.username
     };
+    
+    console.log('Prepared message data:', messageData);
     
     // 데이터베이스에 메시지 저장
     const message = new Message({
       roomId,
-      username: ws.username,
+      sender: ws.username,
       content,
       timestamp: new Date()
     });
     
-    await message.save();
+    const savedMessage = await message.save();
+    console.log('Message saved to database:', savedMessage);
+    
+    // MongoDB에서 저장된 ID를 메시지 데이터에 추가
+    messageData._id = savedMessage._id;
     
     // RabbitMQ에 메시지 발행
+    console.log('Publishing message to RabbitMQ');
     await publishMessage(roomId, messageData);
+    
+    // 발신자에게도 메시지 에코 (자신이 보낸 메시지도 화면에 표시하기 위해)
+    if (ws.readyState === WebSocket.OPEN) {
+      console.log('Echoing message back to sender');
+      ws.send(JSON.stringify(messageData));
+    }
   } catch (error) {
     console.error('Error handling chat message:', error);
     sendErrorToClient(ws, 'Failed to send message');

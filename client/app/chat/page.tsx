@@ -14,6 +14,9 @@ interface Message {
   sender: string;
   content: string;
   timestamp: string;
+  roomId?: string;
+  type?: string;
+  _id?: string;
 }
 
 export default function ChatPage() {
@@ -30,11 +33,13 @@ export default function ChatPage() {
   const router = useRouter();
   const socketRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const selectedRoomRef = useRef<Room | null>(null);
 
   useEffect(() => {
     // Check if user is logged in
     const token = localStorage.getItem('chatToken');
     const storedUsername = localStorage.getItem('chatUsername');
+    const lastRoomId = localStorage.getItem('lastRoomId'); // 마지막 선택 방 기억
     
     if (!token) {
       router.push('/');
@@ -69,34 +74,8 @@ export default function ChatPage() {
         }, 100);
       };
       
-      socket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        console.log('Received: ', data);
-        
-        switch (data.type) {
-          case 'AUTH_SUCCESS':
-            setConnected(true);
-            setError('');
-            break;
-          
-          case 'NEW_MESSAGE':
-            if (data.roomId === selectedRoom?.roomId || data.roomId === selectedRoom?.id) {
-              setMessages(prev => [...prev, data]);
-            }
-            break;
-          
-          case 'MESSAGE_HISTORY':
-            setMessages(data.messages);
-            break;
-          
-          case 'ERROR':
-            setError(data.message);
-            break;
-          
-          default:
-            console.log('Unhandled message type:', data.type);
-        }
-      };
+      // 메시지 핸들러 함수 분리
+      socket.onmessage = handleWebSocketMessage;
       
       socket.onerror = (error) => {
         console.error('WebSocket error:', error);
@@ -131,6 +110,20 @@ export default function ChatPage() {
         if (response.ok) {
           const rooms = await response.json();
           setAvailableRooms(rooms);
+          
+          // 마지막 선택 방이 있으면 해당 방을 선택, 없으면 첫 번째 방 선택
+          if (rooms.length > 0 && !selectedRoom) {
+            if (lastRoomId) {
+              const lastRoom = rooms.find(room => (room.roomId === lastRoomId || room.id === lastRoomId));
+              if (lastRoom) {
+                console.log('Selecting last used room:', lastRoom);
+                subscribeToRoom(lastRoom);
+                return;
+              }
+            }
+            console.log('Auto-selecting first room:', rooms[0]);
+            subscribeToRoom(rooms[0]);
+          }
         }
       } catch (error) {
         console.error('Error fetching rooms:', error);
@@ -159,26 +152,41 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
   
+  // 선택된 방이 변경될 때마다 로그 출력 및 ref 업데이트
+  useEffect(() => {
+    console.log('Selected room changed to:', selectedRoom);
+    selectedRoomRef.current = selectedRoom;
+  }, [selectedRoom]);
+  
   const subscribeToRoom = (room: Room) => {
+    console.log('🔄 Subscribing to room:', room);
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
       setError('Connection not available');
       return;
     }
     
-    // Clear previous messages when changing rooms
-    setMessages([]);
+    // 순서 변경: 먼저 선택된 방 설정 후 메시지 초기화
     setSelectedRoom(room);
+    selectedRoomRef.current = room; // ref 즉시 업데이트
+    setMessages([]);
+    console.log('✅ Selected room set to:', room);
     
     // Subscribe to the selected room
     const roomId = room.roomId || room.id;
+    
+    // 선택한 방 ID를 localStorage에 저장
+    localStorage.setItem('lastRoomId', roomId);
+    
     socketRef.current.send(JSON.stringify({
       type: 'JOIN',
       roomId: roomId
     }));
+    console.log('🔄 JOIN message sent for room:', roomId);
   };
   
   const sendMessage = (e: React.FormEvent) => {
     e.preventDefault();
+    console.log('Sending message in room:', selectedRoom);
     
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
       setError('Connection not available');
@@ -196,8 +204,28 @@ export default function ChatPage() {
     socketRef.current.send(JSON.stringify({
       type: 'MESSAGE',
       roomId: selectedRoom.roomId || selectedRoom.id,
-      content: messageText
+      content: messageText,
+      sender: localStorage.getItem('chatUsername')
     }));
+    
+    // 로컬에서 메시지 추가 - 에코가 작동하지 않을 경우를 대비한 예비 조치
+    // 서버에서 에코가 제대로 동작하지 않는 동안 임시로 활성화
+    const localMessage = {
+      sender: localStorage.getItem('chatUsername'),
+      content: messageText,
+      type: 'NEW_MESSAGE',
+      timestamp: new Date().toISOString(),
+      roomId: selectedRoom?.roomId || selectedRoom?.id || ''
+    };
+    setMessages(prev => {
+      // 중복 방지를 위한 검사
+      const duplicate = prev.some(msg => 
+        msg.content === localMessage.content && 
+        msg.sender === localMessage.sender &&
+        Math.abs(new Date(msg.timestamp).getTime() - new Date(localMessage.timestamp).getTime()) < 1000
+      );
+      return duplicate ? prev : [...prev, localMessage];
+    });
     
     setMessageText('');
   };
@@ -252,6 +280,87 @@ export default function ChatPage() {
       socketRef.current.send(JSON.stringify({ type: 'AUTH', token: localStorage.getItem('chatToken') }));
     }
   }, []);
+
+  // WebSocket 메시지 핸들러 함수
+  function handleWebSocketMessage(event) {
+    const data = JSON.parse(event.data);
+    console.log('💬 WebSocket message received:', data);
+    
+    // 현재 선택된 방 상태 가져오기 (함수가 호출되는 시점의 최신 값)
+    const currentRoom = selectedRoomRef.current;
+    
+    switch (data.type) {
+      case 'AUTH_SUCCESS':
+        setConnected(true);
+        setError('');
+        break;
+      
+      case 'JOIN_SUCCESS':
+        console.log('✅ Successfully joined room:', data.roomId);
+        console.log('Current selectedRoom state:', selectedRoom);
+        console.log('Current selectedRoomRef value:', selectedRoomRef.current);
+        
+        if (selectedRoom === null || (selectedRoom.roomId !== data.roomId && selectedRoom.id !== data.roomId)) {
+          // 서버로부터 방 정보 수신 시 selectedRoom 업데이트
+          const matchedRoom = availableRooms.find(room => room.roomId === data.roomId || room.id === data.roomId);
+          if (matchedRoom) {
+            console.log('Updating selected room to:', matchedRoom);
+            setSelectedRoom(matchedRoom);
+            selectedRoomRef.current = matchedRoom;
+          } else {
+            // 방 목록에 없는 경우 임시 객체 생성
+            console.log('Creating temporary room object:', data.roomId);
+            const tempRoom = {
+              roomId: data.roomId,
+              name: data.roomName || `Room ${data.roomId}`
+            };
+            setSelectedRoom(tempRoom);
+            console.log('Selected room updated to temporary object:', tempRoom);
+            // 방 목록에 임시 방 추가하여 일관성 유지
+            setAvailableRooms(prev => {
+              if (prev.some(r => r.roomId === data.roomId)) return prev;
+              return [...prev, tempRoom];
+            });
+          }
+        }
+        break;
+      
+      case 'NEW_MESSAGE':
+        console.log('📨 Processing NEW_MESSAGE:', data);
+        const targetRoomId = data.roomId;
+        console.log('Current room:', currentRoom, 'Message room ID:', targetRoomId);
+        
+        if (currentRoom && (currentRoom.roomId === targetRoomId || currentRoom.id === targetRoomId)) {
+          console.log('✅ Message is for current room, updating UI');
+          if (data._id) {
+            console.log('Message has ID, checking for duplicates');
+            setMessages(prev => {
+              const exists = prev.some(msg => msg._id === data._id);
+              console.log('Message exists?', exists);
+              if (exists) return prev;
+              return [...prev, data];
+            });
+          } else {
+            console.log('Message has no ID, adding directly');
+            setMessages(prev => [...prev, data]);
+          }
+        } else {
+          console.log('❌ Message is for different room, ignoring');
+        }
+        break;
+      
+      case 'MESSAGE_HISTORY':
+        setMessages(data.messages);
+        break;
+      
+      case 'ERROR':
+        setError(data.message);
+        break;
+      
+      default:
+        console.log('Unhandled message type:', data.type);
+    }
+  }
 
   return (
     <main className="flex flex-col h-screen bg-gray-100">
