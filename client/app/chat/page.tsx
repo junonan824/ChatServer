@@ -2,6 +2,14 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 
+// 방 타입 정의 추가
+type Room = {
+  roomId?: string;
+  id?: string;
+  name: string;
+  description?: string;
+};
+
 interface Message {
   sender: string;
   content: string;
@@ -11,9 +19,10 @@ interface Message {
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [messageText, setMessageText] = useState('');
-  const [selectedRoom, setSelectedRoom] = useState('');
-  const [availableRooms, setAvailableRooms] = useState<string[]>(['room_1', 'room_2']);
+  const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
+  const [availableRooms, setAvailableRooms] = useState<Room[]>([]);
   const [newRoomName, setNewRoomName] = useState('');
+  const [newRoomDescription, setNewRoomDescription] = useState('');
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [username, setUsername] = useState('');
@@ -53,41 +62,39 @@ export default function ChatPage() {
         setTimeout(() => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({
-              command: 'CONNECT',
-              headers: {
-                token: token
-              }
+              type: 'AUTH',
+              token: token
             }));
           }
         }, 100);
       };
       
       socket.onmessage = (event) => {
-        try {
-          const response = JSON.parse(event.data);
-          console.log('Received:', response);
+        const data = JSON.parse(event.data);
+        console.log('Received: ', data);
+        
+        switch (data.type) {
+          case 'AUTH_SUCCESS':
+            setConnected(true);
+            setError('');
+            break;
           
-          switch (response.command) {
-            case 'CONNECTED':
-              setConnected(true);
-              setError('');
-              break;
-              
-            case 'MESSAGE':
-              try {
-                const messageData = JSON.parse(response.body);
-                setMessages(prev => [...prev, messageData]);
-              } catch (err) {
-                console.error('Error parsing message:', err);
-              }
-              break;
-              
-            case 'ERROR':
-              setError(response.body || 'Connection error');
-              break;
-          }
-        } catch (error) {
-          console.error('Error parsing WebSocket message:', error);
+          case 'NEW_MESSAGE':
+            if (data.roomId === selectedRoom?.roomId || data.roomId === selectedRoom?.id) {
+              setMessages(prev => [...prev, data]);
+            }
+            break;
+          
+          case 'MESSAGE_HISTORY':
+            setMessages(data.messages);
+            break;
+          
+          case 'ERROR':
+            setError(data.message);
+            break;
+          
+          default:
+            console.log('Unhandled message type:', data.type);
         }
       };
       
@@ -123,7 +130,7 @@ export default function ChatPage() {
         
         if (response.ok) {
           const rooms = await response.json();
-          setAvailableRooms(rooms.map(room => room.id));
+          setAvailableRooms(rooms);
         }
       } catch (error) {
         console.error('Error fetching rooms:', error);
@@ -139,8 +146,7 @@ export default function ChatPage() {
         socketRef.current.onclose = null; // 연결 종료 이벤트 핸들러 제거
         
         socketRef.current.send(JSON.stringify({
-          command: 'DISCONNECT',
-          headers: {}
+          type: 'DISCONNECT'
         }));
         
         socketRef.current.close(1000, "페이지 이동"); // 정상 종료 코드 사용
@@ -153,7 +159,7 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
   
-  const subscribeToRoom = (roomId: string) => {
+  const subscribeToRoom = (room: Room) => {
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
       setError('Connection not available');
       return;
@@ -161,16 +167,13 @@ export default function ChatPage() {
     
     // Clear previous messages when changing rooms
     setMessages([]);
-    setSelectedRoom(roomId);
+    setSelectedRoom(room);
     
     // Subscribe to the selected room
+    const roomId = room.roomId || room.id;
     socketRef.current.send(JSON.stringify({
-      command: 'SUBSCRIBE',
-      headers: {
-        destination: roomId,
-        id: roomId,
-        'receipt-id': `sub-${Date.now()}`
-      }
+      type: 'JOIN',
+      roomId: roomId
     }));
   };
   
@@ -191,13 +194,9 @@ export default function ChatPage() {
     
     // Send message to the selected room
     socketRef.current.send(JSON.stringify({
-      command: 'SEND',
-      headers: {
-        destination: selectedRoom,
-        'content-type': 'application/json',
-        'receipt-id': `msg-${Date.now()}`
-      },
-      body: messageText
+      type: 'MESSAGE',
+      roomId: selectedRoom.roomId || selectedRoom.id,
+      content: messageText
     }));
     
     setMessageText('');
@@ -220,7 +219,7 @@ export default function ChatPage() {
         },
         body: JSON.stringify({
           name: newRoomName,
-          description: `Created by ${username}`
+          description: newRoomDescription
         }),
       });
       
@@ -229,11 +228,12 @@ export default function ChatPage() {
       }
       
       const roomData = await response.json();
-      setAvailableRooms(prev => [...prev, roomData.id]);
+      setAvailableRooms(prev => [...prev, roomData]);
       setNewRoomName('');
+      setNewRoomDescription('');
       
       // Auto-select the newly created room
-      subscribeToRoom(roomData.id);
+      subscribeToRoom(roomData);
     } catch (err) {
       console.error('Error creating room:', err);
       setError('Failed to create room. Please try again.');
@@ -245,6 +245,13 @@ export default function ChatPage() {
     localStorage.removeItem('chatUsername');
     router.push('/');
   };
+
+  // WebSocket 인증
+  useEffect(() => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && localStorage.getItem('chatToken')) {
+      socketRef.current.send(JSON.stringify({ type: 'AUTH', token: localStorage.getItem('chatToken') }));
+    }
+  }, []);
 
   return (
     <main className="flex flex-col h-screen bg-gray-100">
@@ -278,16 +285,16 @@ export default function ChatPage() {
             <h2 className="text-lg font-semibold mb-2">Chat Rooms</h2>
             <ul className="space-y-1">
               {availableRooms.map(room => (
-                <li key={room}>
+                <li key={room.roomId || room.id || Math.random().toString()}>
                   <button
                     onClick={() => subscribeToRoom(room)}
                     className={`w-full text-left px-3 py-2 rounded ${
-                      selectedRoom === room 
+                      selectedRoom && (selectedRoom.roomId === room.roomId || selectedRoom.id === room.id) 
                         ? 'bg-indigo-100 text-indigo-800' 
                         : 'hover:bg-gray-100'
                     }`}
                   >
-                    {room}
+                    {room.name || `Room ${room.roomId || room.id}`}
                   </button>
                 </li>
               ))}
@@ -303,6 +310,13 @@ export default function ChatPage() {
                 onChange={(e) => setNewRoomName(e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded"
                 placeholder="Room name"
+              />
+              <input
+                type="text"
+                value={newRoomDescription}
+                onChange={(e) => setNewRoomDescription(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded"
+                placeholder="Room description"
               />
               <button
                 onClick={createNewRoom}
